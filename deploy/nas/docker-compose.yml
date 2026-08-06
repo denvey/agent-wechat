@@ -1,0 +1,28 @@
+services:
+  agent-wechat:
+    image: ${AGENT_WECHAT_IMAGE:-agent-wechat:amd64}
+    container_name: ${AGENT_WECHAT_CONTAINER_NAME:-agent-wechat}
+    hostname: ${AGENT_WECHAT_HOSTNAME:-agent-wechat-nas}
+    mac_address: ${AGENT_WECHAT_MAC_ADDRESS:?Set AGENT_WECHAT_MAC_ADDRESS in .env}
+    cpus: "0.75"
+    pids_limit: 384
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_PTRACE
+    ports:
+      - "127.0.0.1:${AGENT_WECHAT_PORT:-6174}:6174"
+    volumes:
+      - ${AGENT_WECHAT_DATA_DIR:-./data}:/data
+      - ${AGENT_WECHAT_HOME_DIR:-./wechat-home}:/home/wechat
+      - ${AGENT_WECHAT_TOKEN_FILE:-./secrets/auth-token}:/data/auth-token:ro
+    environment:
+      PROXY: ${PROXY:-}
+    restart: unless-stopped
+    networks:
+      - openclaw
+
+networks:
+  openclaw:
+    name: ${OPENCLAW_NETWORK:-openclaw_default}
+    external: true
