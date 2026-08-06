@@ -45,12 +45,21 @@ fn is_chat_view(a11y: &A11yNode) -> bool {
         return false;
     }
     let has_contacts = query_selector(a11y, r#"push-button[name="Contacts"]"#).is_some();
-    let has_chats = query_selector(a11y, r#"list[name="Chats"]"#).is_some();
-    has_contacts && has_chats
+    has_contacts && find_chat_list(a11y).is_some()
+}
+
+fn find_chat_list(a11y: &A11yNode) -> Option<&A11yNode> {
+    query_selector(a11y, r#"list[name="Chats"]"#)
+        .or_else(|| query_selector(a11y, r#"list[name="Minimized Groups"]"#))
+}
+
+fn find_chat_list_frame(a11y: &A11yNode) -> Option<FrameHint> {
+    find_frame_for(a11y, r#"list[name="Chats"]"#)
+        .or_else(|| find_frame_for(a11y, r#"list[name="Minimized Groups"]"#))
 }
 
 fn find_selected_chat_item(a11y: &A11yNode) -> Option<&A11yNode> {
-    let chat_list = query_selector(a11y, r#"list[name="Chats"]"#)?;
+    let chat_list = find_chat_list(a11y)?;
     chat_list
         .children
         .as_ref()?
@@ -72,7 +81,7 @@ impl IAState for ChatState {
         if find_selected_chat_item(args.a11y).is_some() {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
-        Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"list[name="Chats"]"#) })
+        Ok(IdentifyResult { identified: true, frame: find_chat_list_frame(args.a11y) })
     }
 
     fn reduce(&self, args: &ReduceArgs) -> AppState {
@@ -105,7 +114,7 @@ impl IAState for ChatOpenState {
         if find_selected_chat_item(args.a11y).is_none() {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
-        Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"list[name="Chats"]"#) })
+        Ok(IdentifyResult { identified: true, frame: find_chat_list_frame(args.a11y) })
     }
 
     fn reduce(&self, args: &ReduceArgs) -> AppState {
@@ -113,7 +122,7 @@ impl IAState for ChatOpenState {
         let a11y = args.a11y;
 
         // Extract opened chat name from header area
-        let chat_list = query_selector(a11y, r#"list[name="Chats"]"#);
+        let chat_list = find_chat_list(a11y);
         let chat_list_right = chat_list
             .and_then(|c| c.bounds.as_ref())
             .map(|b| b.x + b.width)

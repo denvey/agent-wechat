@@ -7,6 +7,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use base64::Engine;
@@ -23,11 +24,32 @@ use crate::tools::exec::ExecOptions;
 use crate::tools::qr::{decode_qr_from_base64, to_data_url};
 use crate::tools::screenshot::capture_screenshot;
 
+/// Only one WebSocket login flow may be active at a time.
+///
+/// The execution layer also serializes GUI plans, but without an admission
+/// guard concurrent login requests queue up and start one after another. That
+/// can repeatedly create or observe QR login sessions after the first client
+/// disconnects. Reject duplicates before they enter the execution queue.
+static LOGIN_WS_LOCK: Mutex<()> = Mutex::const_new(());
+
 pub async fn get_status() -> Json<serde_json::Value> {
+    let session = get_session("default");
+    let wechat_running = crate::tools::wechat_db::find_wechat_pid().is_some();
+    let login_state = match &session {
+        Some(s) if wechat_running && s.login_state == "logged_in" => "logged_in",
+        _ => "logged_out",
+    };
+    let logged_in_user = if wechat_running {
+        session.as_ref().and_then(|s| s.logged_in_user.clone())
+    } else {
+        None
+    };
+
     Json(serde_json::json!({
         "container": "running",
-        "loginState": { "status": "logged_out" },
-        "version": "0.1.0"
+        "loginState": { "status": login_state },
+        "loggedInUser": logged_in_user,
+        "version": env!("CARGO_PKG_VERSION")
     }))
 }
 
@@ -74,6 +96,16 @@ pub async fn auth_status() -> Json<serde_json::Value> {
         .await
         .unwrap_or_default();
     let identified = identify_states(&a11y, &screenshot);
+
+    // Do not reuse a persisted Chat state when the current UI cannot be
+    // identified. Callers must treat this observation as unavailable rather
+    // than as proof that WeChat is still logged in.
+    if identified.main_window.is_none() {
+        return Json(serde_json::json!({
+            "status": "unknown",
+            "loggedInUser": session.logged_in_user,
+        }));
+    }
 
     // Load persisted state and apply reduce
     let mut context = {
@@ -240,6 +272,20 @@ pub async fn login_ws(
 }
 
 async fn handle_login_ws(mut socket: WebSocket, params: LoginWsParams) {
+    let _login_guard = match LOGIN_WS_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::warn!("[login] Rejected concurrent login WebSocket");
+            let msg = serde_json::to_string(&LoginSubscriptionEvent::Error {
+                message: "A login session is already in progress; reuse the active QR code"
+                    .to_string(),
+            })
+            .unwrap();
+            let _ = socket.send(Message::Text(msg.into())).await;
+            return;
+        }
+    };
+
     let session = match get_session("default") {
         Some(s) => s,
         None => {
@@ -416,5 +462,29 @@ fn subscription_event_to_login_event(event: SubscriptionEvent) -> LoginSubscript
         _ => LoginSubscriptionEvent::Status {
             message: format!("Unknown event: {}", event.event_type),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOGIN_WS_LOCK;
+
+    #[tokio::test]
+    async fn login_websocket_lock_allows_only_one_active_session() {
+        let first = LOGIN_WS_LOCK
+            .try_lock()
+            .expect("first login session should acquire the lock");
+
+        assert!(
+            LOGIN_WS_LOCK.try_lock().is_err(),
+            "a concurrent login session must be rejected"
+        );
+
+        drop(first);
+
+        assert!(
+            LOGIN_WS_LOCK.try_lock().is_ok(),
+            "the lock must be released after the active login session ends"
+        );
     }
 }

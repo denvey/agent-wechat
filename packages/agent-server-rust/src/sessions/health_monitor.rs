@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::execution::actions as execution_actions;
+use crate::ia::actions as ui_actions;
 use crate::ia::identify_states;
 use crate::sessions::manager::get_session;
 use crate::tools::a11y::get_a11y_desktop;
@@ -8,11 +10,17 @@ use crate::tools::exec::ExecOptions;
 use crate::tools::screenshot::capture_screenshot;
 use crate::tools::wechat_db::find_wechat_pid;
 
-/// How often to run the health scan (in seconds).
-const SCAN_INTERVAL_SECS: u64 = 1;
+/// How often to check whether the WeChat process is still running.
+const PROCESS_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// How often to run the heavier accessibility-tree and screenshot scan.
+///
+/// Process checks stay frequent for fast crash recovery, while spacing the UI
+/// scan avoids keeping a CPU core busy when WeChat is otherwise idle.
+const UI_SCAN_INTERVAL_SECS: u64 = 30;
 
 /// Kill WeChat if no IA state has been identified for this long (in seconds).
-const UNRESPONSIVE_TIMEOUT_SECS: u64 = 60;
+const UNRESPONSIVE_TIMEOUT_SECS: u64 = 120;
 
 /// Delay before restarting WeChat after a crash (in seconds).
 const RESTART_DELAY_SECS: u64 = 3;
@@ -54,9 +62,10 @@ fn spawn_wechat(session: &crate::ia::types::Session) {
 
 /// Spawn the background health monitor task.
 ///
-/// Every second, it checks the default session's WeChat process by running
-/// a11y → identify. If WeChat has crashed, it restarts it. If no IA state
-/// has been identified for more than 60 seconds, it kills and restarts it.
+/// Every PROCESS_CHECK_INTERVAL_SECS, it checks the default session's WeChat
+/// process. Every UI_SCAN_INTERVAL_SECS, it also runs a11y → identify. If
+/// WeChat has crashed, it restarts it. If the UI remains unavailable for more
+/// than UNRESPONSIVE_TIMEOUT_SECS, it kills and restarts it.
 pub fn spawn_health_monitor() {
     tokio::spawn(async move {
         tracing::info!("[health] WeChat health monitor started");
@@ -66,9 +75,15 @@ pub fn spawn_health_monitor() {
         let mut restart_count: u32 = 0;
         let mut window_start = Instant::now();
         let mut waiting_restart_since: Option<Instant> = None;
+        let mut last_auto_login_attempt: Option<Instant> = None;
+        let mut last_ui_scan =
+            Instant::now() - std::time::Duration::from_secs(UI_SCAN_INTERVAL_SECS);
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(SCAN_INTERVAL_SECS)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                PROCESS_CHECK_INTERVAL_SECS,
+            ))
+            .await;
 
             // Skip if monitoring is paused (an execution loop is active)
             if MONITORING_PAUSED.load(Ordering::Relaxed) {
@@ -92,16 +107,26 @@ pub fn spawn_health_monitor() {
                         tracing::info!("[health] WeChat process found (pid={})", pid);
                         was_running = true;
                         waiting_restart_since = None;
+                        last_auto_login_attempt = None;
+                        last_ui_scan =
+                            Instant::now() - std::time::Duration::from_secs(UI_SCAN_INTERVAL_SECS);
                     }
                     pid
                 }
                 None => {
-                    if was_running {
-                        tracing::warn!(
-                            "[health] WeChat process disappeared (likely crashed), restarting"
-                        );
+                    if waiting_restart_since.is_none() {
+                        if was_running {
+                            tracing::warn!(
+                                "[health] WeChat process disappeared (likely crashed), scheduling restart"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "[health] WeChat process is not running, scheduling restart"
+                            );
+                        }
                         was_running = false;
                         waiting_restart_since = Some(Instant::now());
+                        last_auto_login_attempt = None;
                     }
 
                     // Handle restart with crash loop protection
@@ -136,6 +161,13 @@ pub fn spawn_health_monitor() {
                 }
             };
 
+            // The process check above is cheap and frequent. The accessibility
+            // dump and screenshot below are intentionally rate-limited.
+            if last_ui_scan.elapsed().as_secs() < UI_SCAN_INTERVAL_SECS {
+                continue;
+            }
+            last_ui_scan = Instant::now();
+
             // Run a11y + identify to see if we can detect any state
             let exec_options = ExecOptions {
                 session: Some(session.clone()),
@@ -143,7 +175,13 @@ pub fn spawn_health_monitor() {
             };
 
             let a11y = match get_a11y_desktop(&exec_options).await {
-                Ok(tree) => tree,
+                Ok(tree) => {
+                    // A readable accessibility tree proves the UI process is responsive.
+                    // State recognition can legitimately miss a new/unknown WeChat view,
+                    // so it must not be used as a liveness signal.
+                    last_identified = Instant::now();
+                    tree
+                }
                 Err(_) => {
                     // a11y failed — count as unresponsive, don't reset timer
                     check_and_kill(wechat_pid, &last_identified);
@@ -156,12 +194,25 @@ pub fn spawn_health_monitor() {
                 .unwrap_or_default();
             let identified = identify_states(&a11y, &screenshot);
 
-            if identified.main_window.is_some() {
-                // State identified — WeChat is responsive
-                last_identified = Instant::now();
-            } else {
-                // No state identified — check timeout
-                check_and_kill(wechat_pid, &last_identified);
+            if let Some(main_window) = identified.main_window.as_ref() {
+                if main_window.state_id == "login_account"
+                    && last_auto_login_attempt
+                        .map(|attempt| attempt.elapsed().as_secs() >= 10)
+                        .unwrap_or(true)
+                {
+                    tracing::info!("[health] Confirming remembered WeChat account");
+                    let action = ui_actions::click_login();
+                    let emit = |_event: crate::ia::types::SubscriptionEvent| {};
+                    execution_actions::execute_action(
+                        &action,
+                        main_window.frame.as_ref(),
+                        &exec_options,
+                        &a11y,
+                        &emit,
+                    )
+                    .await;
+                    last_auto_login_attempt = Some(Instant::now());
+                }
             }
         }
     });

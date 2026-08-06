@@ -20,6 +20,7 @@ pub enum LoginPhase {
     DetectingUser,
     ExtractingKeys,
     Done,
+    Failed,
 }
 
 pub struct LoginPlanState {
@@ -28,6 +29,7 @@ pub struct LoginPlanState {
     pub last_emitted_qr: Option<String>,
     pub emitted_phone_confirm: bool,
     pub detect_retries: u32,
+    pub extract_retries: u32,
 }
 
 #[async_trait::async_trait]
@@ -44,6 +46,7 @@ impl Plan for LoginPlan {
             last_emitted_qr: None,
             emitted_phone_confirm: false,
             detect_retries: 0,
+            extract_retries: 0,
         }
     }
 
@@ -93,6 +96,9 @@ impl Plan for LoginPlan {
             }
             LoginPhase::Done => {
                 Some(SelectedAction { action: actions::wait_short(), frame: None })
+            }
+            LoginPhase::Failed => {
+                None // Terminate execution loop — error event already emitted
             }
         }
     }
@@ -305,13 +311,19 @@ async fn handle_detecting_user(
 
     plan_state.detect_retries += 1;
     if plan_state.detect_retries >= 10 {
-        plan_state.phase = LoginPhase::Done;
+        tracing::error!("[login] Failed to detect WeChat user after {} attempts", plan_state.detect_retries);
+        plan_state.phase = LoginPhase::Failed;
         return Some(SelectedAction {
             action: actions::sequence(vec![
                 Action::Emit {
                     event: SubscriptionEvent {
-                        event_type: "login_success".to_string(),
-                        data: std::collections::HashMap::new(),
+                        event_type: "error".to_string(),
+                        data: [(
+                            "message".to_string(),
+                            serde_json::Value::String(
+                                "Login succeeded but could not detect WeChat user. Please try again.".to_string()
+                            ),
+                        )].into_iter().collect(),
                     },
                 },
                 actions::wait_short(),
@@ -322,6 +334,8 @@ async fn handle_detecting_user(
 
     Some(SelectedAction { action: actions::wait(2000), frame: None })
 }
+
+const MAX_EXTRACT_RETRIES: u32 = 3;
 
 async fn handle_extracting_keys(
     plan_state: &mut LoginPlanState,
@@ -340,30 +354,83 @@ async fn handle_extracting_keys(
         .or_else(|| find_wechat_pid())
     };
 
+    let mut extracted = false;
+
     if let (Some(pid), Some(acct)) = (wechat_pid, plan_state.account_dir.clone()) {
-        match extract_keys_async(pid).await {
-            keys if !keys.is_empty() => {
-                let db = get_db();
-                store_keys(&db, session_id, &acct, &keys);
-            }
-            _ => {
-                tracing::error!("[login] Key extraction failed");
-            }
+        let keys = extract_keys_async(pid).await;
+        if !keys.is_empty() {
+            let db = get_db();
+            store_keys(&db, session_id, &acct, &keys);
+            extracted = true;
+        } else {
+            plan_state.extract_retries += 1;
+            tracing::error!(
+                "[login] Key extraction failed (attempt {}/{})",
+                plan_state.extract_retries,
+                MAX_EXTRACT_RETRIES
+            );
         }
+    } else {
+        plan_state.extract_retries += 1;
+        tracing::error!(
+            "[login] Cannot extract keys: pid={:?}, account={:?} (attempt {}/{})",
+            wechat_pid,
+            plan_state.account_dir,
+            plan_state.extract_retries,
+            MAX_EXTRACT_RETRIES
+        );
     }
 
-    plan_state.phase = LoginPhase::Done;
+    if !extracted && plan_state.extract_retries < MAX_EXTRACT_RETRIES {
+        // Wait before retrying — WeChat may still be initializing its DBs
+        return Some(SelectedAction {
+            action: actions::sequence(vec![
+                Action::Emit {
+                    event: SubscriptionEvent {
+                        event_type: "status".to_string(),
+                        data: [(
+                            "message".to_string(),
+                            serde_json::Value::String(format!(
+                                "Retrying credential extraction ({}/{})...",
+                                plan_state.extract_retries, MAX_EXTRACT_RETRIES
+                            )),
+                        )].into_iter().collect(),
+                    },
+                },
+                actions::wait(5000),
+            ]),
+            frame: frame.clone(),
+        });
+    }
+
+    if !extracted {
+        // All retries exhausted — clear logged_in_user so /api/status is consistent
+        tracing::error!("[login] Key extraction failed after {} attempts, login incomplete", MAX_EXTRACT_RETRIES);
+        let db = get_db();
+        queries::update_session_logged_in_user(&db, session_id, None);
+    }
+
+    plan_state.phase = if extracted { LoginPhase::Done } else { LoginPhase::Failed };
     Some(SelectedAction {
         action: actions::sequence(vec![
             Action::Emit {
                 event: SubscriptionEvent {
-                    event_type: "login_success".to_string(),
-                    data: plan_state.account_dir.as_ref()
-                        .map(|a| [(
-                            "userId".to_string(),
-                            serde_json::Value::String(a.clone()),
-                        )].into_iter().collect())
-                        .unwrap_or_default(),
+                    event_type: if extracted { "login_success" } else { "error" }.to_string(),
+                    data: if extracted {
+                        plan_state.account_dir.as_ref()
+                            .map(|a| [(
+                                "userId".to_string(),
+                                serde_json::Value::String(a.clone()),
+                            )].into_iter().collect())
+                            .unwrap_or_default()
+                    } else {
+                        [(
+                            "message".to_string(),
+                            serde_json::Value::String(
+                                "Login succeeded but credential extraction failed. Please try logging in again.".to_string()
+                            ),
+                        )].into_iter().collect()
+                    },
                 },
             },
             actions::wait_short(),

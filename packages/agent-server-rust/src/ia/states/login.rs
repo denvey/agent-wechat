@@ -58,8 +58,10 @@ impl IAState for LoginAccountState {
     fn id(&self) -> &str { "login_account" }
 
     fn identify(&self, args: &IdentifyArgs) -> Result<IdentifyResult, String> {
-        let log_in_btn = query_selector(args.a11y, r#"push-button[name="Log In"]"#)
-            .or_else(|| query_selector(args.a11y, r#"push-button[name="Open WeChat"]"#));
+        let log_in_btn = query_selector(
+            args.a11y,
+            r#"push-button[name=/^(Log In|Open WeChat|Enter WeChat|Enter Weixin)$/]"#,
+        );
         if log_in_btn.is_none() {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
@@ -125,13 +127,15 @@ impl IAState for LoginLoadingState {
             return Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"label[name*="Loading"]"#) });
         }
 
-        // Case 2: Nav buttons but no Chats list
+        // Case 2: Nav buttons but no visible chat list
         let main_btn = query_selector(args.a11y, r#"push-button[name="Weixin"]"#)
             .or_else(|| query_selector(args.a11y, r#"push-button[name="WeChat"]"#));
         let has_contacts = query_selector(args.a11y, r#"push-button[name="Contacts"]"#).is_some();
         let has_chats = query_selector(args.a11y, r#"list[name="Chats"]"#).is_some();
+        let has_minimized_groups =
+            query_selector(args.a11y, r#"list[name="Minimized Groups"]"#).is_some();
 
-        if main_btn.is_some() && has_contacts && !has_chats {
+        if main_btn.is_some() && has_contacts && !has_chats && !has_minimized_groups {
             return Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"push-button[name="Contacts"]"#) });
         }
 
