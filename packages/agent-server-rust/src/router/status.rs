@@ -14,6 +14,7 @@ use base64::Engine;
 use crate::context::create_context;
 use crate::db::get_db;
 use crate::execution::run_execution_loop;
+use crate::ia::selectors::query_selector;
 use crate::ia::types::*;
 use crate::ia::{find_state_by_id, identify_states};
 use crate::plans::login::{LoginParams, LoginPlan};
@@ -31,6 +32,36 @@ use crate::tools::screenshot::capture_screenshot;
 /// can repeatedly create or observe QR login sessions after the first client
 /// disconnects. Reject duplicates before they enter the execution queue.
 static LOGIN_WS_LOCK: Mutex<()> = Mutex::const_new(());
+
+fn has_logged_in_navigation_shell(a11y: &A11yNode) -> bool {
+    query_selector(a11y, r#"tool-bar[name="Navigation"]"#).is_some()
+        && query_selector(a11y, r#"tool-bar[name="Navigation"] push-button[name=/^(Weixin|WeChat)$/]"#).is_some()
+        && query_selector(a11y, r#"tool-bar[name="Navigation"] push-button[name="Contacts"]"#).is_some()
+        && query_selector(a11y, r#"tool-bar[name="Navigation"] push-button[name="More"]"#).is_some()
+}
+
+fn has_explicit_login_ui(a11y: &A11yNode) -> bool {
+    query_selector(a11y, r#"label[name="Entering"]"#).is_some()
+        || query_selector(a11y, r#"label[name*="Loading"]"#).is_some()
+        || query_selector(a11y, r#"label[name*="Scan to log in"]"#).is_some()
+        || query_selector(a11y, r#"push-button[name="Switch Account"]"#).is_some()
+        || query_selector(a11y, r#"label[name=/Comfirm on phone|Confirm.*phone|手机确认/i]"#).is_some()
+}
+
+fn observed_auth_status(a11y: &A11yNode, identified: &IdentifiedStates) -> &'static str {
+    if has_explicit_login_ui(a11y) {
+        return "logged_out";
+    }
+    if let Some(main_window) = identified.main_window.as_ref() {
+        return match main_window.state_id.as_str() {
+            "chat" | "chat_open" => "logged_in",
+            "login_qr" | "login_account" | "login_phone_confirm" | "login_loading" => "logged_out",
+            _ if has_logged_in_navigation_shell(a11y) => "logged_in",
+            _ => "unknown",
+        };
+    }
+    if has_logged_in_navigation_shell(a11y) { "logged_in" } else { "unknown" }
+}
 
 pub async fn get_status() -> Json<serde_json::Value> {
     let session = get_session("default");
@@ -55,8 +86,8 @@ pub async fn get_status() -> Json<serde_json::Value> {
 
 /// Check auth status via one FSM observation cycle.
 ///
-/// Gets the a11y tree, identifies the current state, and runs
-/// the reducer. Chat states set `is_logged_in = true`.
+/// Explicit login views are logged out. Chat views and the complete logged-in
+/// navigation shell are logged in. Other observations remain unknown.
 pub async fn auth_status() -> Json<serde_json::Value> {
     let session = match get_session("default") {
         Some(s) => s,
@@ -96,51 +127,12 @@ pub async fn auth_status() -> Json<serde_json::Value> {
         .await
         .unwrap_or_default();
     let identified = identify_states(&a11y, &screenshot);
-
-    // Do not reuse a persisted Chat state when the current UI cannot be
-    // identified. Callers must treat this observation as unavailable rather
-    // than as proof that WeChat is still logged in.
-    if identified.main_window.is_none() {
-        return Json(serde_json::json!({
-            "status": "unknown",
-            "loggedInUser": session.logged_in_user,
-        }));
-    }
-
-    // Load persisted state and apply reduce
-    let mut context = {
-        let db = get_db();
-        create_context(session.clone(), &db)
-    };
-
-    if let Some(ref mw) = identified.main_window {
-        if let Some(state_impl) = find_state_by_id(&mw.state_id) {
-            let screenshot_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&screenshot)
-                .unwrap_or_default();
-            context.state = state_impl.reduce(&ReduceArgs {
-                prev: &context.state,
-                a11y: &a11y,
-                screenshot: &screenshot_bytes,
-            });
-        }
-    }
-
-    // Save updated state
-    {
-        let db = get_db();
-        context.save(&db);
-    }
-
-    let status = if context.state.main_window.is_logged_in {
-        "logged_in"
-    } else {
-        "logged_out"
-    };
+    let status = observed_auth_status(&a11y, &identified);
 
     tracing::info!(
-        "[auth_status] view={:?}, status={}",
-        context.state.main_window.view,
+        "[auth_status] identified={:?}, navigation_shell={}, status={}",
+        identified.main_window.as_ref().map(|s| s.state_id.as_str()),
+        has_logged_in_navigation_shell(&a11y),
         status
     );
 
@@ -467,7 +459,28 @@ fn subscription_event_to_login_event(event: SubscriptionEvent) -> LoginSubscript
 
 #[cfg(test)]
 mod tests {
-    use super::LOGIN_WS_LOCK;
+    use super::{observed_auth_status, LOGIN_WS_LOCK};
+    use crate::ia::identify_states;
+    use crate::ia::types::A11yNode;
+
+    fn node(role: &str, name: &str, children: Vec<A11yNode>) -> A11yNode {
+        A11yNode {
+            role: role.to_string(), name: name.to_string(), bounds: None,
+            children: (!children.is_empty()).then_some(children), parent_index: None,
+            window: None, states: None,
+        }
+    }
+
+    fn logged_in_page(list_name: &str) -> A11yNode {
+        node("desktop-frame", "main", vec![node("frame", "WeChat", vec![
+            node("tool-bar", "Navigation", vec![
+                node("push-button", "Weixin", vec![]),
+                node("push-button", "Contacts", vec![]),
+                node("push-button", "More", vec![]),
+            ]),
+            node("list", list_name, vec![]),
+        ])])
+    }
 
     #[tokio::test]
     async fn login_websocket_lock_allows_only_one_active_session() {
@@ -486,5 +499,44 @@ mod tests {
             LOGIN_WS_LOCK.try_lock().is_ok(),
             "the lock must be released after the active login session ends"
         );
+    }
+
+    #[test]
+    fn service_accounts_page_is_logged_in_without_becoming_a_chat_state() {
+        let a11y = logged_in_page("Service Accounts");
+        let identified = identify_states(&a11y, "");
+        assert!(identified.main_window.is_none());
+        assert_eq!(observed_auth_status(&a11y, &identified), "logged_in");
+    }
+
+    #[test]
+    fn explicit_login_loading_overrides_navigation_shell() {
+        let mut a11y = logged_in_page("Service Accounts");
+        a11y.children.as_mut().unwrap()[0].children.as_mut().unwrap()
+            .push(node("label", "Entering", vec![]));
+        let identified = identify_states(&a11y, "");
+        assert_eq!(identified.main_window.as_ref().map(|s| s.state_id.as_str()), Some("login_loading"));
+        assert_eq!(observed_auth_status(&a11y, &identified), "logged_out");
+    }
+
+    #[test]
+    fn partial_navigation_is_unknown() {
+        let a11y = node("desktop-frame", "main", vec![node("tool-bar", "Navigation", vec![
+            node("push-button", "Weixin", vec![]),
+            node("push-button", "Contacts", vec![]),
+        ])]);
+        let identified = identify_states(&a11y, "");
+        assert_eq!(observed_auth_status(&a11y, &identified), "unknown");
+    }
+
+    #[test]
+    fn qr_login_elements_are_logged_out_even_without_qr_decode() {
+        let a11y = node("desktop-frame", "main", vec![node("frame", "WeChat", vec![
+            node("label", "Scan to log in", vec![]),
+            node("push-button", "Transfer files only", vec![]),
+        ])]);
+        let identified = identify_states(&a11y, "");
+        assert!(identified.main_window.is_none());
+        assert_eq!(observed_auth_status(&a11y, &identified), "logged_out");
     }
 }

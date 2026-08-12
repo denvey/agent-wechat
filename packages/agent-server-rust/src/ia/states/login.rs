@@ -119,24 +119,13 @@ impl IAState for LoginLoadingState {
     fn id(&self) -> &str { "login_loading" }
 
     fn identify(&self, args: &IdentifyArgs) -> Result<IdentifyResult, String> {
-        // Case 1: "Entering" or "Loading X%" labels
+        // Only explicit transition indicators identify the loading state.
+        // Logged-in pages may show navigation without a chat list.
         if query_selector(args.a11y, r#"label[name="Entering"]"#).is_some() {
             return Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"label[name="Entering"]"#) });
         }
         if query_selector(args.a11y, r#"label[name*="Loading"]"#).is_some() {
             return Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"label[name*="Loading"]"#) });
-        }
-
-        // Case 2: Nav buttons but no visible chat list
-        let main_btn = query_selector(args.a11y, r#"push-button[name="Weixin"]"#)
-            .or_else(|| query_selector(args.a11y, r#"push-button[name="WeChat"]"#));
-        let has_contacts = query_selector(args.a11y, r#"push-button[name="Contacts"]"#).is_some();
-        let has_chats = query_selector(args.a11y, r#"list[name="Chats"]"#).is_some();
-        let has_minimized_groups =
-            query_selector(args.a11y, r#"list[name="Minimized Groups"]"#).is_some();
-
-        if main_btn.is_some() && has_contacts && !has_chats && !has_minimized_groups {
-            return Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"push-button[name="Contacts"]"#) });
         }
 
         Ok(IdentifyResult { identified: false, frame: None })
@@ -196,3 +185,41 @@ pub static LOGIN_STATES: std::sync::LazyLock<Vec<Box<dyn IAState>>> = std::sync:
         Box::new(LoginLoadingState),
     ]
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ia::identify_states;
+
+    fn node(role: &str, name: &str, children: Vec<A11yNode>) -> A11yNode {
+        A11yNode {
+            role: role.to_string(), name: name.to_string(), bounds: None,
+            children: (!children.is_empty()).then_some(children), parent_index: None,
+            window: None, states: None,
+        }
+    }
+
+    #[test]
+    fn logged_in_navigation_without_chat_list_is_not_login_loading() {
+        let a11y = node("desktop-frame", "main", vec![node("frame", "WeChat", vec![
+            node("tool-bar", "Navigation", vec![
+                node("push-button", "Weixin", vec![]),
+                node("push-button", "Contacts", vec![]),
+                node("push-button", "More", vec![]),
+            ]),
+            node("list", "Service Accounts", vec![]),
+        ])]);
+
+        assert!(identify_states(&a11y, "").main_window.is_none());
+    }
+
+    #[test]
+    fn explicit_loading_indicator_is_still_login_loading() {
+        let a11y = node("desktop-frame", "main", vec![node(
+            "frame", "WeChat", vec![node("label", "Entering", vec![])]
+        )]);
+
+        let states = identify_states(&a11y, "");
+        assert_eq!(states.main_window.as_ref().map(|s| s.state_id.as_str()), Some("login_loading"));
+    }
+}
